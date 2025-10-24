@@ -1,5 +1,6 @@
 // /api/whatsapp-webhook.js
 // EUROCAM: respuestas por palabra clave + soporte para botones (quick replies)
+// + LOG de STATUSES (entregado/leído/errores) para diagnosticar envíos
 
 const VERIFY_TOKEN = process.env.VERIFY_TOKEN || "eurocam123";
 const WHATSAPP_TOKEN = process.env.WHATSAPP_TOKEN;             // token largo de Meta
@@ -8,6 +9,15 @@ const TEMPLATE_NAME = process.env.TEMPLATE_NAME_AUTOREPLY || "respuesta_automati
 const TEMPLATE_LANG = process.env.TEMPLATE_LANG_CODE || "es";  // usa "es" si tu plantilla no tiene es_AR
 
 const WABA_URL = (id) => `https://graph.facebook.com/v20.0/${id}/messages`;
+
+// ---------- util ----------
+function tsToISO(ts) {
+  // Meta manda epoch (seg) en statuses[].timestamp
+  if (!ts) return "";
+  const n = Number(ts) * 1000;
+  if (Number.isNaN(n)) return String(ts);
+  return new Date(n).toISOString();
+}
 
 async function postWABA(payload) {
   const res = await fetch(WABA_URL(PHONE_NUMBER_ID), {
@@ -51,9 +61,9 @@ async function sendTemplate(to) {
 
 // Extrae selección de botón (plantillas quick-reply o mensajes interactivos)
 function pickButton(msg) {
-  // Plantilla quick reply: messages[0].button.text
+  // Plantilla quick reply
   if (msg?.button?.text) return (msg.button.text || "").toLowerCase();
-  // Interactivo: messages[0].interactive.button_reply.text
+  // Interactivo
   const br = msg?.interactive?.button_reply;
   if (br?.text) return (br.text || "").toLowerCase();
   if (br?.id) return (br.id || "").toLowerCase();
@@ -62,7 +72,10 @@ function pickButton(msg) {
 
 // Respuesta por palabra clave (ventas/administración) para EUROCAM
 function buildAutoReply(messageText) {
-  const t = (messageText || "").normalize("NFD").replace(/\p{Diacritic}/gu, "").toLowerCase();
+  const t = (messageText || "")
+    .normalize("NFD")
+    .replace(/\p{Diacritic}/gu, "")
+    .toLowerCase();
 
   const ventas =
     "📍 *Sucursales de Ventas - EUROCAM*\n" +
@@ -85,6 +98,37 @@ function buildAutoReply(messageText) {
   return generic;
 }
 
+// ---------- NUEVO: log de statuses ----------
+function logStatuses(statuses) {
+  try {
+    for (const s of statuses || []) {
+      const {
+        id,                // id del mensaje original
+        status,            // delivered, read, failed, sent, etc.
+        timestamp,         // epoch seg
+        recipient_id,      // destinatario (waid)
+        conversation,      // info de conversación/plantilla
+        pricing,           // info de cobro
+        errors,            // array con objetos de error (si failed)
+      } = s || {};
+
+      const iso = tsToISO(timestamp);
+
+      if (status === "failed") {
+        console.error("🛑 STATUS FAILED", {
+          id, status, iso, recipient_id, conversation, pricing, errors,
+        });
+      } else {
+        console.log("📬 STATUS", {
+          id, status, iso, recipient_id, conversation, pricing,
+        });
+      }
+    }
+  } catch (e) {
+    console.error("Error al registrar statuses:", e);
+  }
+}
+
 export default async function handler(req, res) {
   try {
     // Verificación de Meta (GET)
@@ -98,21 +142,25 @@ export default async function handler(req, res) {
       return res.status(403).send("Error de verificación");
     }
 
-    // Mensajes entrantes (POST)
+    // Mensajes / estados entrantes (POST)
     if (req.method === "POST") {
       const body = req.body || {};
       const value = body?.entry?.[0]?.changes?.[0]?.value;
 
-      // ignorar callbacks de status
-      if (value?.statuses) return res.status(200).end();
+      // 0) LOG DE STATUSES (NO LOS IGNORAMOS MÁS)
+      if (value?.statuses) {
+        logStatuses(value.statuses);
+        return res.status(200).end();
+      }
 
+      // 1) Mensajes
       const msg = value?.messages?.[0];
       const from = msg?.from;
       if (!from || !msg) return res.status(200).end();
 
       console.log("📩 Mensaje recibido de", from, ":", msg?.text?.body || "(no-text)");
 
-      // 1) Si viene de botón, tratamos como palabra clave
+      // 1.1) Botón → tratamos como palabra clave
       const buttonChoice = pickButton(msg);
       if (buttonChoice) {
         const reply = buildAutoReply(buttonChoice);
@@ -120,11 +168,11 @@ export default async function handler(req, res) {
         return res.status(200).end();
       }
 
-      // 2) Si escribió texto, intentamos match por palabra clave
+      // 1.2) Texto → palabra clave
       const text = (msg?.text?.body || "").toString();
       if (text) {
         const reply = buildAutoReply(text);
-        // Si respondió genérico, podemos intentar plantilla (si ya está aprobada)
+        // Si respondió genérico, intentamos plantilla (si está aprobada)
         if (reply.includes("canal automatizado")) {
           const ok = await sendTemplate(from);
           if (!ok) await sendText(from, reply); // fallback si la plantilla aún está en revisión
@@ -134,7 +182,7 @@ export default async function handler(req, res) {
         return res.status(200).end();
       }
 
-      // 3) Si no hay texto ni botón (ej. medios), devolvemos ayuda genérica
+      // 1.3) Sin texto/botón (ej. medios) → ayuda genérica
       const ok = await sendTemplate(from);
       if (!ok) {
         await sendText(
@@ -156,3 +204,4 @@ export default async function handler(req, res) {
 
 // Para que Vercel parsee JSON de la request
 export const config = { api: { bodyParser: true } };
+
